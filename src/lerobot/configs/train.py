@@ -26,6 +26,11 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from lerobot import envs
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
+from lerobot.configs import parser
+from lerobot.configs.default import DatasetConfig, EvalConfig, SwanLabConfig, WandBConfig
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.optim import OptimizerConfig
+from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
@@ -110,7 +115,10 @@ class TrainPipelineConfig(HubMixin):
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
+    # Select experiment tracker: "wandb", "swanlab", "both", or "none"
+    tracker: str = "none"
     wandb: WandBConfig = field(default_factory=WandBConfig)
+    swanlab: SwanLabConfig = field(default_factory=SwanLabConfig)
     peft: PeftConfig | None = None
 
     # Sample weighting configuration (e.g., for RA-BC training)
@@ -133,6 +141,18 @@ class TrainPipelineConfig(HubMixin):
         return self.policy  # type: ignore[return-value]
 
     def validate(self) -> None:
+        # Validate tracker selection
+        if self.tracker not in ["wandb", "swanlab", "both", "none"]:
+            raise ValueError(
+                f"tracker must be one of 'wandb', 'swanlab', 'both', or 'none', got '{self.tracker}'"
+            )
+
+        # Enable the selected trackers
+        if self.tracker in ["wandb", "both"]:
+            self.wandb.enable = True
+        if self.tracker in ["swanlab", "both"]:
+            self.swanlab.enable = True
+
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         reward_model_path = parser.get_path_arg("reward_model")
