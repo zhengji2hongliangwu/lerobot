@@ -1,0 +1,180 @@
+# ============================================================================
+# X-VLA 训练配置（保存 eval_loss 最低模型：xvla_train_best.py 专用）
+# ============================================================================
+# 用法：
+#   bash run_xvla_train_best.sh --config_path ./xvla_demo_config_best.yaml
+#
+# 说明：
+#   · 本 yaml 与 xvla_demo_config_evalsplit.yaml 字段完全一致（同一套 patch），
+#     只是配套 xvla_train_best.py 使用。保存分两条互相独立的线：
+#       1) 周期保存：按 save_freq 保存到 checkpoints/step_N/，并刷新 last（框架原逻辑）；
+#       2) best 保存：每当 eval_loss 刷新历史最低，就在那一步立刻把当前模型独立落盘到
+#          checkpoints/best/（覆盖式，只保留最优那一份），并写 best_model.json。
+#   · best 由 eval 结果独立触发，不要求 eval_steps == save_freq：最优步即使不是保存步
+#     也会被独立保存（下方两者都填 200 只是让评估/保存节奏一致，便于对照）。
+
+# ---------------------------------------------------------------------------
+# 数据集（本地 SO-100/SO-101 follower，4 episodes / 1997 frames / 30fps）
+# ---------------------------------------------------------------------------
+# - action:        6 维（shoulder_pan/lift, elbow, wrist_flex/roll, gripper）
+# - state:         6 维（同上）
+# - 相机：          2 路（observation.images.top / observation.images.wrist，480x640 视频）
+# - 数据集格式：     LeRobot v3.0，root 直接指向含 meta/data/videos 的目录
+# ---------------------------------------------------------------------------
+dataset:
+  # 仅作 Hub/cache 标识，root 已显式指定时不会触发下载
+  repo_id: local/pickup_demo
+  # 本地数据集根目录（含 meta/ data/ videos/ 的目录本身）
+  root: /mnt/data2/jizheng/datasets/pickup_put_trimmed
+  # 只取部分 episode 加快跑通速度；全量训练时设为 null
+  episodes: null
+  # 图像增强（默认关闭）
+  image_transforms:
+    enable: false
+  # 图像是否使用 ImageNet 均值/方差归一化
+  use_imagenet_stats: true
+  # 返回 uint8 降低 DataLoader 开销
+  return_uint8: false
+  # 流式训练（本地数据已落盘，保持 false）
+  streaming: false
+  # 离线评估用的留出比例（每个 task 最后 ceil(n*ratio) 个 episode 作验证集）
+  # 注意：> 0 时才允许开启 eval_steps（同源切分场景）。
+  # 下方已配置顶层 `eval_dataset` 独立验证集，评估不再从训练集切分，
+  # 因此这里保持 0.0 即可（会被忽略）。
+  eval_split: 0.0
+
+# ---------------------------------------------------------------------------
+# 独立验证数据集（可选，由 xvla_train.py 的 make_train_eval_datasets patch 使用）
+# ---------------------------------------------------------------------------
+# 指定后：训练集使用上面 dataset 的全量数据，离线评估使用本块指定的独立数据集；
+#         不指定则回落到按 dataset.eval_split 的同源 episode 切分。
+# 指定本块时无需设置 dataset.eval_split（保持 0.0 即可）。
+eval_dataset:
+  # 仅作 Hub/cache 标识，root 已显式指定时不会触发下载
+  repo_id: local/pickup_demo1
+  # 独立验证集根目录（含 meta/ data/ videos/ 的目录本身）
+  root: /mnt/data2/jizheng/datasets/pickup_put_eval_trimmed
+  # 其余字段可选：repo_type / revision，缺省沿用 dataset 的配置
+
+# ---------------------------------------------------------------------------
+# 域 ID（X-VLA 跨本体核心，必须配置！）
+# ---------------------------------------------------------------------------
+# domain_id 决定 soft_prompt_hub 查表时取哪一行 prompt——不同 domain 对应不同
+# 机器人本体/数据域的预训练 soft prompt。复用预训练中最像你机器人的那个 ID
+# 才能让跨本体能力生效；不配就走预训练默认值 0（=Bridge，末端执行器控制），
+# 对 SO-101 单臂关节控制并不贴切。
+#
+# 预训练已占用 ID（来自 docs/source/xvla.mdx）：
+#   0=Bridge  1=RT1  2=Calvin  3=LIBERO  4=WidowX-air  5=AIR-AGILEX-HQ
+#   6=RoboTwin2  7=RoboCasa-human  8=VLABench  9=AGIBOT-challenge
+#   10=AIR-AGILEX  18=AIRBOT
+#
+# 对 SO-101 单臂 + 关节空间控制，最像的是 AIRBOT(18)；
+# 想自己从头训一组新 prompt 也可挑 11~17/19~29 这些未占用槽位。
+domain_id: 0
+
+# ---------------------------------------------------------------------------
+# 相机键重命名（关键！）
+# ---------------------------------------------------------------------------
+# demo 数据集的相机键是 observation.images.top / observation.images.wrist，
+# 而 lerobot/xvla-base 的 config.json 写死了期望 observation.images.image /
+# image2 / image3。
+# rename_map 把数据集键映射到 policy 期望键，仅重命名 observation（图像/state），
+# 不影响 action。映射后缺失的 image3 由 _prepare_images 自动补零占位。
+# action / observation.state 的键名与 policy 期望一致，无需在此映射。
+rename_map:
+  observation.images.top: observation.images.image
+  observation.images.wrist: observation.images.image2
+
+# ---------------------------------------------------------------------------
+# 策略模型（X-VLA）
+# ---------------------------------------------------------------------------
+policy:
+  # 从预训练 checkpoint 微调；从头训练请改为 null 并自行提供 florence_config
+  path: lerobot/xvla-base
+  # 动作空间：auto 会根据数据集自动推断真实动作维度（推荐用于新机器人）
+  action_mode: auto
+  # 模型输出动作维度，需与预训练权重保持一致（demo 为 6 维，<=20 即可）
+  max_action_dim: 20
+  # 状态维度（demo 为 6 维，<=20 即可）
+  max_state_dim: 20
+  # 预测动作块长度 / 实际执行步数
+  chunk_size: 32
+  n_action_steps: 32
+  # 精度：bfloat16 可显著降低显存占用
+  dtype: bfloat16
+  # 设备
+  device: cuda
+  # 是否使用本体感知状态
+  use_proprio: true
+  # 图像统一 resize 到 224x224（与预训练一致）
+  resize_imgs_with_padding: [224, 224]
+  # 相机视角数量：与 lerobot/xvla-base 预训练一致（3 路）
+  # 实际视角数取 max(num_image_views, 数据集相机数 + empty_cameras)。
+  # demo 有 2 个相机，缺失的 image3 由 _prepare_images 自动补零占位，
+  # 因此 empty_cameras 保持 0 即可（设 1 也只会得到 max(3, 3) = 3，无额外收益）
+  num_image_views: 3
+  empty_cameras: 0
+  # 域 ID：demo 为真实机器人数据，由 XVLAAddDomainIdProcessorStep 自动注入
+
+  # ---- 微调策略（Phase II 适配推荐：不冻结 VLM，全量微调）----
+  freeze_vision_encoder: false
+  freeze_language_encoder: false
+  train_policy_transformer: true
+  train_soft_prompts: true
+
+  # ---- 优化器 / 调度器（策略内置预设，use_policy_training_preset=true 时生效）----
+  optimizer_lr: 1.0e-4
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+
+  # 是否推送到 Hub
+  push_to_hub: false
+
+# ---------------------------------------------------------------------------
+# 输出与任务
+# ---------------------------------------------------------------------------
+# null 则自动生成 outputs/train/YYYY-MM-DD/HH-MM-SS_<job_name>
+output_dir: null
+job_name: xvla_demo_best
+
+# ---------------------------------------------------------------------------
+# 训练通用参数
+# ---------------------------------------------------------------------------
+seed: 42
+resume: false
+cudnn_deterministic: false
+
+# 每张 GPU 的 batch size（显存不足时调小；demo 仅 1997 帧，建议小一些）
+batch_size: 32
+num_workers: 4
+prefetch_factor: 2
+persistent_workers: true
+
+# 跑通用少量步数；正式训练建议 20000 步以上
+steps: 5000
+log_freq: 10
+# 离线评估间隔（0 = 关闭）。使用顶层 eval_dataset 独立验证集时直接填 > 0 即可
+eval_steps: 10
+max_eval_samples: 100
+save_checkpoint: true
+# 周期保存间隔（best 由 eval 独立触发，与此无关；此处与 eval_steps 相同便于对照）
+save_freq: 1000
+
+# 使用策略内置的训练预设（自动覆盖全局 optimizer / scheduler）
+use_policy_training_preset: true
+
+# ---------------------------------------------------------------------------
+# WandB 日志（新仓库内置支持）
+# ---------------------------------------------------------------------------
+wandb:
+  enable: true
+  project: xvla
+  # entity: null
+  # notes: null
+  # run_id: null
+  # online | offline | disabled（无外网/未登录时用 offline）
+  # 注意：此处会覆盖 WANDB_MODE 环境变量，key 未配置时必须用 offline
+  mode: online
+  # add_tags: true
+  # disable_artifact: false

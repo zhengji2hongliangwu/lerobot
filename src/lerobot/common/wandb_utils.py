@@ -16,6 +16,7 @@
 import logging
 import os
 import re
+import time
 from glob import glob
 from pathlib import Path
 
@@ -24,6 +25,14 @@ from termcolor import colored
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
+
+# Support both WandB and SwanLab logging backends.
+try:
+    import swanlab
+
+    SWANLAB_AVAILABLE = True
+except ImportError:
+    SWANLAB_AVAILABLE = False
 
 
 def cfg_to_group(
@@ -58,7 +67,15 @@ def cfg_to_group(
     return lst if return_list else "-".join(lst)
 
 
-def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
+def get_wandb_run_id_from_filesystem(log_dir: Path, backend: str = "wandb") -> str:
+    # Get the run ID from filesystem.
+    if backend == "swanlab":
+        paths = glob(str(log_dir / "swanlog" / "**/swan-*/logs"), recursive=True)
+        if len(paths) < 1:
+            raise RuntimeError("Couldn't get the previous SwanLab run ID for run resumption.")
+        exp_folder = paths[0].split("/")[-2]
+        return exp_folder
+
     # Get the WandB run ID.
     paths = glob(str(log_dir / "wandb/latest-run/run-*"))
     if len(paths) != 1:
@@ -76,7 +93,7 @@ def get_safe_wandb_artifact_name(name: str):
 
 
 class WandBLogger:
-    """A helper class to log object using wandb."""
+    """A helper class to log object using wandb or swanlab."""
 
     def __init__(self, cfg: TrainPipelineConfig):
         self.cfg = cfg.wandb
@@ -85,6 +102,16 @@ class WandBLogger:
         self.env_fps = cfg.env.fps if cfg.env else None
         self._group = cfg_to_group(cfg)
 
+        # Determine which backend to use.
+        self.backend = getattr(self.cfg, "backend", "wandb")
+
+        if self.backend == "swanlab":
+            self._init_swanlab(cfg)
+        else:
+            self._init_wandb(cfg)
+
+    def _init_wandb(self, cfg: TrainPipelineConfig):
+        """Initialize the WandB backend."""
         # Set up WandB.
         os.environ["WANDB_SILENT"] = "True"
         import wandb
@@ -92,7 +119,7 @@ class WandBLogger:
         wandb_run_id = (
             cfg.wandb.run_id
             if cfg.wandb.run_id
-            else get_wandb_run_id_from_filesystem(self.log_dir)
+            else get_wandb_run_id_from_filesystem(self.log_dir, backend="wandb")
             if cfg.resume
             else None
         )
@@ -125,17 +152,77 @@ class WandBLogger:
         self._wandb_custom_step_key: set[str] | None = None
         logging.info(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
         logging.info(f"Track this run --> {colored(wandb.run.get_url(), 'yellow', attrs=['bold'])}")
-        self._wandb = wandb
+        self._backend_lib = wandb
+
+    def _init_swanlab(self, cfg: TrainPipelineConfig):
+        """Initialize the SwanLab backend."""
+        if not SWANLAB_AVAILABLE:
+            raise ImportError("SwanLab is not installed. Please install it with: pip install swanlab")
+
+        swanlab_run_id = (
+            cfg.wandb.run_id
+            if cfg.wandb.run_id
+            else get_wandb_run_id_from_filesystem(self.log_dir, backend="swanlab")
+            if cfg.resume
+            else None
+        )
+
+        # Map the wandb mode to a swanlab mode.
+        mode_map = {
+            "online": "cloud",
+            "cloud": "cloud",
+            "offline": "offline",
+            "disabled": "disabled",
+            "local": "local",
+        }
+        swanlab_mode = mode_map.get(self.cfg.mode, "cloud") if self.cfg.mode else "cloud"
+
+        swanlab.init(
+            id=swanlab_run_id,
+            project=self.cfg.project,
+            workspace=self.cfg.entity,
+            experiment_name=self.job_name,
+            description=self.cfg.notes,
+            tags=cfg_to_group(cfg, return_list=True, truncate_tags=True) if self.cfg.add_tags else None,
+            logdir=str(self.log_dir / "swanlog"),
+            config=cfg.to_dict(),
+            job_type="train_eval",
+            resume="must" if cfg.resume else None,
+            mode=swanlab_mode,
+            # Read the API key from the environment when present.
+            api_key=os.environ.get("SWANLAB_API_KEY"),
+        )
+        # SwanLab uses 'name' for the run identifier, not 'id'.
+        run_id = swanlab.run.name if hasattr(swanlab.run, "name") else str(time.time())
+        # NOTE: We will override the cfg.wandb.run_id with the swanlab run id.
+        # This is because we want to be able to resume the run from the swanlab run id.
+        cfg.wandb.run_id = run_id
+        # Handle custom step key for rl asynchronous training.
+        self._wandb_custom_step_key: set[str] | None = None
+        logging.info(colored("Logs will be synced with swanlab.", "blue", attrs=["bold"]))
+        if hasattr(swanlab.run, "url"):
+            logging.info(f"Track this run --> {colored(swanlab.run.url, 'yellow', attrs=['bold'])}")
+        else:
+            logging.warning(colored("SwanLab run URL not available", "yellow"))
+        self._backend_lib = swanlab
 
     def log_policy(self, checkpoint_dir: Path):
-        """Checkpoints the policy to wandb."""
+        """Checkpoints the policy to wandb/swanlab."""
         if self.cfg.disable_artifact:
+            return
+
+        if self.backend == "swanlab":
+            # SwanLab doesn't support artifacts in the same way as WandB.
+            logging.info(
+                f"SwanLab does not support model artifacts like WandB. "
+                f"Skipping model artifact logging for checkpoint: {checkpoint_dir}"
+            )
             return
 
         step_id = checkpoint_dir.name
         artifact_name = f"{self._group}-{step_id}"
         artifact_name = get_safe_wandb_artifact_name(artifact_name)
-        artifact = self._wandb.Artifact(artifact_name, type="model")
+        artifact = self._backend_lib.Artifact(artifact_name, type="model")
         pretrained_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
 
         # Check if this is a PEFT model (has adapter files instead of model.safetensors)
@@ -162,7 +249,7 @@ class WandBLogger:
             )
             return
 
-        self._wandb.log_artifact(artifact)
+        self._backend_lib.log_artifact(artifact)
 
     def log_dict(
         self, d: dict, step: int | None = None, mode: str = "train", custom_step_key: str | None = None
@@ -171,6 +258,26 @@ class WandBLogger:
             raise ValueError(mode)
         if step is None and custom_step_key is None:
             raise ValueError("Either step or custom_step_key must be provided.")
+
+        if self.backend == "swanlab":
+            # SwanLab implementation.
+            for k, v in d.items():
+                if not isinstance(v, (int | float | str)):
+                    logging.warning(
+                        f'SwanLab logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'
+                    )
+                    continue
+
+                # Skip the custom step key here, it's added to the data below.
+                if custom_step_key is not None and k == custom_step_key:
+                    continue
+
+                if custom_step_key is not None:
+                    data = {f"{mode}/{k}": v, f"{mode}/{custom_step_key}": d[custom_step_key]}
+                    self._backend_lib.log(data)
+                else:
+                    self._backend_lib.log(data={f"{mode}/{k}": v}, step=step)
+            return
 
         # NOTE: This is not simple. Wandb step must always monotonically increase and it
         # increases with each wandb.log call, but in the case of asynchronous RL for example,
@@ -183,7 +290,7 @@ class WandBLogger:
             new_custom_key = f"{mode}/{custom_step_key}"
             if new_custom_key not in self._wandb_custom_step_key:
                 self._wandb_custom_step_key.add(new_custom_key)
-                self._wandb.define_metric(new_custom_key, hidden=True)
+                self._backend_lib.define_metric(new_custom_key, hidden=True)
 
         batch_data = {}
         for k, v in d.items():
@@ -202,13 +309,25 @@ class WandBLogger:
         if batch_data:
             if custom_step_key is not None:
                 batch_data[f"{mode}/{custom_step_key}"] = d[custom_step_key]
-                self._wandb.log(batch_data)
+                self._backend_lib.log(batch_data)
             else:
-                self._wandb.log(data=batch_data, step=step)
+                self._backend_lib.log(data=batch_data, step=step)
 
     def log_video(self, video_path: str, step: int, mode: str = "train"):
         if mode not in {"train", "eval"}:
             raise ValueError(mode)
 
-        wandb_video = self._wandb.Video(video_path, fps=self.env_fps, format="mp4")
-        self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+        if self.backend == "swanlab":
+            # SwanLab's Video API only supports GIF files.
+            if not str(video_path).lower().endswith(".gif"):
+                logging.warning(
+                    f"SwanLab only supports GIF format for video logging. "
+                    f"Skipping video: {video_path} (expected .gif file)"
+                )
+                return
+            video = self._backend_lib.Video(str(video_path), caption=f"{mode}_video")
+            self._backend_lib.log({f"{mode}/video": video}, step=step)
+            return
+
+        wandb_video = self._backend_lib.Video(video_path, fps=self.env_fps, format="mp4")
+        self._backend_lib.log({f"{mode}/video": wandb_video}, step=step)

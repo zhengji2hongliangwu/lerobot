@@ -102,6 +102,8 @@ class WandBConfig:
     console_multipart: bool = False
     console_chunk_max_seconds: int = 0
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
+    # Backend to use for logging: 'wandb' or 'swanlab'
+    backend: str = "wandb"
 
 
 @dataclass

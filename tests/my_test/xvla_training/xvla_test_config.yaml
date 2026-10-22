@@ -1,0 +1,133 @@
+# ============================================================================
+# X-VLA 训练配置（小数据集跑通用：lerobot/pusht）
+# ============================================================================
+# 用法：
+#   lerobot-train --config_path ./xvla_pusht_config.yaml
+# 或先改好 dataset.repo_id / policy.path 后用配套的 lerobot_xvla_train.sh 启动。
+
+# ---------------------------------------------------------------------------
+# 数据集（lerobot/pusht：206 episodes / 25650 frames / 96x96 图像 / 2 维动作）
+# ---------------------------------------------------------------------------
+dataset:
+  repo_id: lerobot/pickup_demo
+  # 本地数据集根目录（repo_id 下载到缓存后可留空）
+  root: /mnt/data2/jizheng/datasets/pickup_demo_trimmed
+  # 只取部分 episode 加快跑通速度；全量训练时设为 null
+  episodes: null
+  # 图像增强（默认关闭）
+  image_transforms:
+    enable: false
+  # 图像是否使用 ImageNet 均值/方差归一化
+  use_imagenet_stats: true
+  # 返回 uint8 降低 DataLoader 开销
+  return_uint8: false
+  # 不下载到本地、边流式边训练（网络受限时可设 true）
+  streaming: false
+  # 离线评估用的留出比例（每个 task 最后 ceil(n*ratio) 个 episode 作验证集）
+  # 注意：> 0 时才允许设置下面的 eval_steps；跑通阶段保持 0.0 关闭
+  eval_split: 0.0
+
+# ---------------------------------------------------------------------------
+# 相机键重命名（关键！）
+# ---------------------------------------------------------------------------
+# pusht 的相机键是 observation.image（单数），而 lerobot/xvla-base 的 config.json
+# 写死了期望 observation.images.image / image2 / image3。
+# rename_map 把数据集键映射到 policy 期望键，仅重命名 observation（图像/state），
+# 不影响 action。映射后缺失的 image2/image3 由 _prepare_images 自动补零占位。
+# rename_map:
+#   observation.image: observation.images.image
+rename_map:
+  observation.images.top: observation.images.image
+  observation.images.wrist: observation.images.image2
+# ---------------------------------------------------------------------------
+# 策略模型（X-VLA）
+# ---------------------------------------------------------------------------
+policy:
+  # 从预训练 checkpoint 微调；从头训练请改为 null 并自行提供 florence_config
+  path: lerobot/xvla-base
+  # 动作空间：auto 会根据数据集自动推断真实动作维度（推荐用于新机器人）
+  action_mode: auto
+  # 模型输出动作维度，需与预训练权重保持一致
+  max_action_dim: 20
+  # 状态维度
+  max_state_dim: 20
+  # 预测动作块长度 / 实际执行步数
+  chunk_size: 32
+  n_action_steps: 32
+  # 精度：bfloat16 可显著降低显存占用
+  dtype: bfloat16
+  # 设备
+  device: cuda
+  # 是否使用本体感知状态
+  use_proprio: true
+  # 图像统一 resize 到 224x224（与预训练一致）
+  resize_imgs_with_padding: [224, 224]
+  # 相机视角数量：与 lerobot/xvla-base 预训练一致（3 路）
+  # 实际视角数取 max(num_image_views, 数据集相机数 + empty_cameras)。
+  # pusht 只有 1 个相机，缺失的 image2/image3 由 _prepare_images 自动补零占位，
+  # 因此 empty_cameras 保持 0 即可（设 2 也只会得到 max(3, 3) = 3，无额外收益）
+  num_image_views: 3
+  empty_cameras: 0
+  # 域 ID：pusht 为仿真数据，选一个最接近的（Bridge=0）
+  # 由 XVLAAddDomainIdProcessorStep 自动注入，此处无需显式设置
+
+  # ---- 微调策略（Phase II 适配推荐：不冻结 VLM，全量微调）----
+  freeze_vision_encoder: false
+  freeze_language_encoder: false
+  train_policy_transformer: true
+  train_soft_prompts: true
+
+  # ---- 优化器 / 调度器（策略内置预设，use_policy_training_preset=true 时生效）----
+  optimizer_lr: 1.0e-4
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+
+  # 是否推送到 Hub
+  push_to_hub: false
+
+# ---------------------------------------------------------------------------
+# 输出与任务
+# ---------------------------------------------------------------------------
+# null 则自动生成 outputs/train/YYYY-MM-DD/HH-MM-SS_<job_name>
+output_dir: null
+job_name: xvla_pickup_demo
+
+# ---------------------------------------------------------------------------
+# 训练通用参数
+# ---------------------------------------------------------------------------
+seed: 42
+resume: false
+cudnn_deterministic: false
+
+# 每张 GPU 的 batch size（显存不足时调小）
+batch_size: 32
+num_workers: 4
+prefetch_factor: 2
+persistent_workers: true
+
+# 跑通用少量步数；正式训练建议 20000 步以上
+steps: 20000
+log_freq: 100
+# 离线评估间隔（0 = 关闭）。开启前必须把 dataset.eval_split 设为 > 0
+eval_steps: 0
+max_eval_samples: 0
+save_checkpoint: true
+save_freq: 2000
+
+# 使用策略内置的训练预设（自动覆盖全局 optimizer / scheduler）
+use_policy_training_preset: true
+
+# ---------------------------------------------------------------------------
+# WandB 日志（新仓库内置支持）
+# ---------------------------------------------------------------------------
+wandb:
+  enable: true
+  project: xvla
+  # entity: null
+  # notes: null
+  # run_id: null
+  # online | offline | disabled（无外网/未登录时用 offline）
+  # 注意：此处会覆盖 WANDB_MODE 环境变量，key 未配置时必须用 offline
+  mode: online
+  # add_tags: true
+  # disable_artifact: false
